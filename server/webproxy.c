@@ -1,4 +1,5 @@
 #include "gfserver.h"
+#include "proxy-student.h"
 
 #define USAGE                                                                         \
 "usage:\n"                                                                            \
@@ -23,10 +24,14 @@ static struct option gLongOptions[] = {
 #define MAX_REQUEST_LENGTH_N 822
 
 static gfserver_t gfs;
+static proxy_worker_t *workers;
 
 static void _sig_handler(int signo){
   if (signo == SIGTERM || signo == SIGINT){
+    proxy_shutdown();
     gfserver_stop(&gfs);
+    // No curl_global_cleanup() here: libcurl forbids it while other threads may
+    // still be using curl, and gfserver_stop() doesn't wait for the workers.
     exit(signo);
   }
 }
@@ -51,6 +56,13 @@ int main(int argc, char **argv) {
 
   if (signal(SIGTERM, _sig_handler) == SIG_ERR){
     fprintf(stderr,"Can't catch SIGTERM...exiting.\n");
+    exit(SERVER_FAILURE);
+  }
+
+  // A client hanging up mid-transfer makes gfserver's write() raise SIGPIPE,
+  // which would kill the whole proxy; ignore it so the write fails with EPIPE
+  if (signal(SIGPIPE, SIG_IGN) == SIG_ERR){
+    fprintf(stderr,"Can't ignore SIGPIPE...exiting.\n");
     exit(SERVER_FAILURE);
   }
 
@@ -95,15 +107,32 @@ int main(int argc, char **argv) {
     exit(__LINE__);
   }
 
+  // libcurl's global init is not thread-safe, so do it before any workers start
+  if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+    fprintf(stderr, "Failed to initialize libcurl\n");
+    exit(SERVER_FAILURE);
+  }
+
   // Initialize server structure here
   gfserver_init(&gfs, nworkerthreads);
 // Set server options here
   gfserver_setopt(&gfs, GFS_MAXNPENDING, 90);
-  gfserver_setopt(&gfs, GFS_WORKER_FUNC, handle_with_file);
+  gfserver_setopt(&gfs, GFS_WORKER_FUNC, handle_with_curl);
   gfserver_setopt(&gfs, GFS_PORT, port);
   // Set up arguments for worker here
+  // Each thread gets its own curl handle (easy handles can't be shared
+  // between threads) that it reuses across requests
+  if (NULL == (workers = calloc(nworkerthreads, sizeof(*workers)))) {
+    fprintf(stderr, "Failed to allocate worker state\n");
+    exit(SERVER_FAILURE);
+  }
   for(i = 0; i < nworkerthreads; i++) {
-    gfserver_setopt(&gfs, GFS_WORKER_ARG, i, "arg");
+    workers[i].server = server;
+    if (NULL == (workers[i].curl = curl_easy_init())) {
+      fprintf(stderr, "Failed to create curl handle\n");
+      exit(SERVER_FAILURE);
+    }
+    gfserver_setopt(&gfs, GFS_WORKER_ARG, i, &workers[i]);
   }
   // Invoke the framework - this is an infinite loop and shouldn't return
   gfserver_serve(&gfs);
