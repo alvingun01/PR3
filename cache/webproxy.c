@@ -44,11 +44,12 @@ static struct option gLongOptions[] = {
 //gfs
 static gfserver_t gfs;
 //handles cache
-extern ssize_t handle_with_cache(gfcontext_t *ctx, char *path, void* arg);
+extern ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg);
 
 static void _sig_handler(int signo){
   if (signo == SIGTERM || signo == SIGINT){
-    //cleanup could go here
+    // Remove the shared memory segments first, then stop the server
+    cache_proxy_shutdown();
     gfserver_stop(&gfs);
     exit(signo);
   }
@@ -61,17 +62,34 @@ int main(int argc, char **argv) {
   unsigned short port = 25362;
   unsigned short nworkerthreads = 8;
   size_t segsize = 5712;
+  struct sigaction sa;
 
   //disable buffering on stdout so it prints immediately */
   setbuf(stdout, NULL);
 
-  if (signal(SIGTERM, _sig_handler) == SIG_ERR) {
+  // Block both signals while the handler runs, so a SIGINT and a SIGTERM in
+  // quick succession can't interrupt the cleanup on the same thread
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = _sig_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGINT);
+  sigaddset(&sa.sa_mask, SIGTERM);
+
+  if (sigaction(SIGTERM, &sa, NULL) < 0) {
     fprintf(stderr,"Can't catch SIGTERM...exiting.\n");
     exit(SERVER_FAILURE);
   }
 
-  if (signal(SIGINT, _sig_handler) == SIG_ERR) {
+  if (sigaction(SIGINT, &sa, NULL) < 0) {
     fprintf(stderr,"Can't catch SIGINT...exiting.\n");
+    exit(SERVER_FAILURE);
+  }
+
+  // A client hanging up mid-transfer makes gfserver's write() raise SIGPIPE,
+  // which would kill the proxy without removing its segments; ignore it so
+  // the write fails with EPIPE instead
+  if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+    fprintf(stderr,"Can't ignore SIGPIPE...exiting.\n");
     exit(SERVER_FAILURE);
   }
 
@@ -137,10 +155,14 @@ int main(int argc, char **argv) {
 
 
 
-  /* Initialize shared memory set-up here
+  // Initialize shared memory set-up here: the pool of segments and the
+  // queue of free ones (the proxy owns the data channel)
+  if (cache_proxy_init(nsegments, segsize) < 0) {
+    fprintf(stderr, "Unable to create the shared memory segments\n");
+    exit(SERVER_FAILURE);
+  }
 
   // Initialize server structure here
-  */
   gfserver_init(&gfs, nworkerthreads);
 
   // Set server options here
@@ -148,11 +170,8 @@ int main(int argc, char **argv) {
   gfserver_setopt(&gfs, GFS_WORKER_FUNC, handle_with_cache);
   gfserver_setopt(&gfs, GFS_MAXNPENDING, 187);
 
-  // Set up arguments for worker here
-  for(int i = 0; i < nworkerthreads; i++) {
-    gfserver_setopt(&gfs, GFS_WORKER_ARG, i, "data");
-  }
-  
+  // The workers all share the segment pool, so they need no arguments
+
   // Invokethe framework - this is an infinite loop and will not return
   gfserver_serve(&gfs);
 
