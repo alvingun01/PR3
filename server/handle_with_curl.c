@@ -201,11 +201,17 @@ ssize_t handle_with_curl(gfcontext_t *ctx, const char *path, void* arg){
 	ssize_t ret = SERVER_FAILURE;
 
 	/*
-	 * gfserver_stop() cancels the worker threads. Being cancelled inside
-	 * libcurl would leak this request's buffers and leave the reused handle
-	 * mid-transfer, and unwinding through these frames trips AddressSanitizer
-	 * at thread exit. Defer cancellation until the request is done; it then
-	 * takes effect back in the gfserver worker loop.
+	 * Make this worker non-cancellable for the rest of its life (it is never
+	 * restored). gfserver_stop() cancels the workers right before exit():
+	 *  - Cancelled inside libcurl, a worker would leak this request's buffers
+	 *    and leave its reused handle mid-transfer, and unwinding through these
+	 *    frames trips AddressSanitizer at thread exit.
+	 *  - Cancelled while idle, a worker that has done TLS exits while exit()
+	 *    runs OpenSSL's atexit cleanup, which assumes no other thread is
+	 *    running. If OpenSSL's globals are gone first, the thread's per-thread
+	 *    random generators are never freed (a ~2.5 KB LeakSanitizer report).
+	 * Left alone, the worker stays blocked in gfserver's queue until the
+	 * process exits, and its OpenSSL state stays reachable.
 	 */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
 
@@ -219,13 +225,11 @@ ssize_t handle_with_curl(gfcontext_t *ctx, const char *path, void* arg){
 	/*
 	 * Once shutdown has begun, don't return into gfserver: gfserver_stop()
 	 * frees the worker contexts without waiting for the threads, so touching
-	 * them afterwards is a use-after-free. Idle here (still non-cancellable)
-	 * until the process exits.
+	 * them afterwards is a use-after-free. Idle here until the process exits.
 	 */
 	while (is_shutting_down())
 		pause();
 
-	pthread_setcancelstate(old_cancel_state, NULL);
 	return ret;
 }
 
